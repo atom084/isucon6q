@@ -1,0 +1,71 @@
+--- isutar.go	2016-10-25 19:25:43.528047636 +0900
++++ /home/isucon/isu6q-app/isutar.go	2016-10-27 19:08:27.756939579 +0900
+@@ -7,7 +7,6 @@
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+-	"strconv"
+ 
+ 	_ "github.com/go-sql-driver/mysql"
+ 	"github.com/gorilla/mux"
+@@ -50,6 +49,8 @@
+ 
+ func starsPostHandler(w http.ResponseWriter, r *http.Request) {
+ 	keyword := r.FormValue("keyword")
++	log.Println(keyword)
++	//keyword := r.URL.Query().Get("keyword")
+ 
+ 	origin := os.Getenv("ISUDA_ORIGIN")
+ 	if origin == "" {
+@@ -57,6 +58,7 @@
+ 	}
+ 	u, err := r.URL.Parse(fmt.Sprintf("%s/keyword/%s", origin, pathURIEscape(keyword)))
+ 	panicIf(err)
++	//log.Println(u)
+ 	resp, err := http.Get(u.String())
+ 	panicIf(err)
+ 	defer resp.Body.Close()
+@@ -65,7 +67,7 @@
+ 		return
+ 	}
+ 
+-	user := r.FormValue("user")
++	user := r.URL.Query().Get("user")
+ 	_, err = db.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
+ 	panicIf(err)
+ 
+@@ -73,18 +75,12 @@
+ }
+ 
+ func main() {
+-	host := os.Getenv("ISUTAR_DB_HOST")
+-	if host == "" {
+-		host = "localhost"
+-	}
+-	portstr := os.Getenv("ISUTAR_DB_PORT")
+-	if portstr == "" {
+-		portstr = "3306"
+-	}
+-	port, err := strconv.Atoi(portstr)
+-	if err != nil {
+-		log.Fatalf("Failed to read DB port number from an environment variable ISUTAR_DB_PORT.\nError: %s", err.Error())
++	var err error
++	dbunix := os.Getenv("ISUDA_DB_UNIX")
++	if dbunix == "" {
++		dbunix = "/var/run/mysqld/mysqld.sock"
+ 	}
++
+ 	user := os.Getenv("ISUTAR_DB_USER")
+ 	if user == "" {
+ 		user = "root"
+@@ -96,8 +92,8 @@
+ 	}
+ 
+ 	db, err = sql.Open("mysql", fmt.Sprintf(
+-		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
+-		user, password, host, port, dbname,
++		"%s:%s@unix(%s)/%s?loc=Local&parseTime=true&interpolateParams=true&collation=utf8mb4_bin",
++		user, password, dbunix, dbname,
+ 	))
+ 	if err != nil {
+ 		log.Fatalf("Failed to connect to DB: %s.", err.Error())

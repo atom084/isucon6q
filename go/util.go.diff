@@ -1,0 +1,38 @@
+--- util.go	2016-10-25 19:25:43.528047636 +0900
++++ /home/isucon/isu6q-app/util.go	2016-10-27 19:08:27.792939579 +0900
+@@ -1,11 +1,11 @@
+ package main
+ 
+ import (
+-	"fmt"
++	//"fmt"
+ 	"net/http"
+ 	"net/url"
+-	"os"
+-	"runtime/debug"
++	//"os"
++	//"runtime/debug"
+ )
+ 
+ func prepareHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+@@ -21,13 +21,13 @@
+ 
+ func myHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
+-		defer func() {
+-			if err := recover(); err != nil {
+-				fmt.Fprintf(os.Stderr, "%+v", err)
+-				debug.PrintStack()
+-				http.Error(w, http.StatusText(500), 500)
+-			}
+-		}()
++		//defer func() {
++		//	if err := recover(); err != nil {
++		//		fmt.Fprintf(os.Stderr, "%+v", err)
++		//		debug.PrintStack()
++		//		http.Error(w, http.StatusText(500), 500)
++		//	}
++		//}()
+ 		prepareHandler(fn)(w, r)
+ 	}
+ }

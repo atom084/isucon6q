@@ -1,0 +1,386 @@
+--- isuda.go	2016-10-25 19:25:43.528047636 +0900
++++ /home/isucon/isu6q-app/isuda.go	2016-10-27 19:08:27.752939579 +0900
+@@ -14,9 +14,10 @@
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+-	"regexp"
+ 	"strconv"
+ 	"strings"
++	"sync"
++	"time"
+ 
+ 	"github.com/Songmu/strrand"
+ 	_ "github.com/go-sql-driver/mysql"
+@@ -31,7 +32,6 @@
+ )
+ 
+ var (
+-	isutarEndpoint string
+ 	isupamEndpoint string
+ 
+ 	baseUrl *url.URL
+@@ -39,6 +39,8 @@
+ 	re      *render.Render
+ 	store   *sessions.CookieStore
+ 
++	HostName string
++
+ 	errInvalidUser = errors.New("Invalid User")
+ )
+ 
+@@ -70,16 +72,56 @@
+ }
+ 
+ func initializeHandler(w http.ResponseWriter, r *http.Request) {
++	noprofile := r.URL.Query().Get("noprofile")
++	if noprofile == "" {
++		////StartProfile(90 * time.Second)
++	}
++
+ 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
+ 	panicIf(err)
+ 
+-	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
++	_, err = db.Exec("TRUNCATE star")
+ 	panicIf(err)
+-	defer resp.Body.Close()
++
++	Startup()
+ 
+ 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+ }
+ 
++var (
++	mTopEnts     sync.Mutex
++	topEntsCache []*Entry
++	topEntsLast  time.Time = time.Now()
++)
++
++func getTopEntries() []*Entry {
++	now := time.Now()
++	mTopEnts.Lock()
++	defer mTopEnts.Unlock()
++	if topEntsLast.After(now) {
++		return topEntsCache
++	}
++	topEntsLast = time.Now()
++
++	rows, err := db.Query("SELECT * FROM entry ORDER BY updated_at DESC LIMIT 10")
++	if err != nil {
++		panicIf(err)
++	}
++	defer rows.Close()
++
++	entries := make([]*Entry, 0, 10)
++	for rows.Next() {
++		e := Entry{}
++		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
++		panicIf(err)
++		e.Html = htmlify(e.Description)
++		e.Stars = loadStars(e.Keyword)
++		entries = append(entries, &e)
++	}
++	topEntsCache = entries
++	return entries
++}
++
+ func topHandler(w http.ResponseWriter, r *http.Request) {
+ 	if err := setName(w, r); err != nil {
+ 		forbidden(w)
+@@ -93,27 +135,33 @@
+ 	}
+ 	page, _ := strconv.Atoi(p)
+ 
+-	rows, err := db.Query(fmt.Sprintf(
+-		"SELECT * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
+-		perPage, perPage*(page-1),
+-	))
+-	if err != nil && err != sql.ErrNoRows {
+-		panicIf(err)
+-	}
+-	entries := make([]*Entry, 0, 10)
+-	for rows.Next() {
+-		e := Entry{}
+-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+-		panicIf(err)
+-		e.Html = htmlify(w, r, e.Description)
+-		e.Stars = loadStars(e.Keyword)
+-		entries = append(entries, &e)
++	var entries []*Entry
++
++	if page == 1 {
++		entries = getTopEntries()
++	} else {
++		rows, err := db.Query(fmt.Sprintf(
++			"SELECT * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
++			perPage, perPage*(page-1),
++		))
++		if err != nil && err != sql.ErrNoRows {
++			panicIf(err)
++		}
++		entries = make([]*Entry, 0, 10)
++		for rows.Next() {
++			e := Entry{}
++			err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
++			panicIf(err)
++			e.Html = htmlify(e.Description)
++			e.Stars = loadStars(e.Keyword)
++			entries = append(entries, &e)
++		}
++		rows.Close()
+ 	}
+-	rows.Close()
+ 
+ 	var totalEntries int
+ 	row := db.QueryRow(`SELECT COUNT(*) FROM entry`)
+-	err = row.Scan(&totalEntries)
++	err := row.Scan(&totalEntries)
+ 	if err != nil && err != sql.ErrNoRows {
+ 		panicIf(err)
+ 	}
+@@ -170,6 +218,7 @@
+ 		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
+ 	`, userID, keyword, description, userID, keyword, description)
+ 	panicIf(err)
++	AddKeyword(keyword, keywordLink(keyword))
+ 	http.Redirect(w, r, "/", http.StatusFound)
+ }
+ 
+@@ -262,7 +311,7 @@
+ 		notFound(w)
+ 		return
+ 	}
+-	e.Html = htmlify(w, r, e.Description)
++	e.Html = htmlify(e.Description)
+ 	e.Stars = loadStars(e.Keyword)
+ 
+ 	re.HTML(w, http.StatusOK, "keyword", struct {
+@@ -301,59 +350,39 @@
+ 	}
+ 	_, err = db.Exec(`DELETE FROM entry WHERE keyword = ?`, keyword)
+ 	panicIf(err)
++
++	RemoveKeyword(keyword)
+ 	http.Redirect(w, r, "/", http.StatusFound)
+ }
+ 
+-func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
+-	if content == "" {
+-		return ""
+-	}
+-	rows, err := db.Query(`
+-		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
+-	`)
++func keywordLink(k string) string {
++	ke := pathURIEscape(k)
++	ku := html.EscapeString(k)
++	return fmt.Sprintf(`<a href="http://%s/keyword/%s">%s</a>`, HostName, ke, ku)
++}
++
++func Startup() {
++	rows, err := db.Query("SELECT keyword FROM entry")
+ 	panicIf(err)
+-	entries := make([]*Entry, 0, 500)
++
++	kws := make(KeywordArray, 0, 1000)
+ 	for rows.Next() {
+-		e := Entry{}
+-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
++		var k string
++		err := rows.Scan(&k)
+ 		panicIf(err)
+-		entries = append(entries, &e)
++		kws = append(kws, Keyword{Key: k, Link: keywordLink(k)})
+ 	}
+ 	rows.Close()
+ 
+-	keywords := make([]string, 0, 500)
+-	for _, entry := range entries {
+-		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
+-	}
+-	re := regexp.MustCompile("("+strings.Join(keywords, "|")+")")
+-	kw2sha := make(map[string]string)
+-	content = re.ReplaceAllStringFunc(content, func(kw string) string {
+-		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
+-		return kw2sha[kw]
+-	})
+-	content = html.EscapeString(content)
+-	for kw, hash := range kw2sha {
+-		u, err := r.URL.Parse(baseUrl.String()+"/keyword/" + pathURIEscape(kw))
+-		panicIf(err)
+-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
+-		content = strings.Replace(content, hash, link, -1)
+-	}
+-	return strings.Replace(content, "\n", "<br />\n", -1)
++	InitKeyword(kws)
+ }
+ 
+-func loadStars(keyword string) []*Star {
+-	v := url.Values{}
+-	v.Set("keyword", keyword)
+-	resp, err := http.Get(fmt.Sprintf("%s/stars", isutarEndpoint) + "?" + v.Encode())
+-	panicIf(err)
+-	defer resp.Body.Close()
+-
+-	var data struct {
+-		Result []*Star `json:result`
++func htmlify(content string) string {
++	if content == "" {
++		return ""
+ 	}
+-	err = json.NewDecoder(resp.Body).Decode(&data)
+-	panicIf(err)
+-	return data.Result
++	content = ReplaceKeyword(content)
++	return strings.Replace(content, "\n", "<br />\n", -1)
+ }
+ 
+ func isSpamContents(content string) bool {
+@@ -389,19 +418,59 @@
+ 	return session
+ }
+ 
+-func main() {
+-	host := os.Getenv("ISUDA_DB_HOST")
+-	if host == "" {
+-		host = "localhost"
+-	}
+-	portstr := os.Getenv("ISUDA_DB_PORT")
+-	if portstr == "" {
+-		portstr = "3306"
++// TODO:オンメモリ化
++func loadStars(keyword string) []*Star {
++	rows, err := db.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
++	if err != nil && err != sql.ErrNoRows {
++		panicIf(err)
++		return nil
+ 	}
+-	port, err := strconv.Atoi(portstr)
+-	if err != nil {
+-		log.Fatalf("Failed to read DB port number from an environment variable ISUDA_DB_PORT.\nError: %s", err.Error())
++
++	stars := make([]*Star, 0, 10)
++	for rows.Next() {
++		s := Star{}
++		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
++		panicIf(err)
++		stars = append(stars, &s)
++	}
++	rows.Close()
++	return stars
++}
++
++// from istar 使ってないかも
++func starsHandler(w http.ResponseWriter, r *http.Request) {
++	keyword := r.FormValue("keyword")
++
++	stars := loadStars(keyword)
++
++	re.JSON(w, http.StatusOK, map[string][]*Star{
++		"result": stars,
++	})
++}
++
++// from istar
++func starsPostHandler(w http.ResponseWriter, r *http.Request) {
++	keyword := r.FormValue("keyword")
++
++	var i int
++	err := db.QueryRow(`SELECT COUNT(*) FROM entry WHERE keyword = ?`, keyword).Scan(&i)
++	if err == sql.ErrNoRows {
++		notFound(w)
++		return
++	}
++	if i == 0 {
++		notFound(w)
++		return
+ 	}
++
++	user := r.URL.Query().Get("user")
++	_, err = db.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
++	panicIf(err)
++
++	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
++}
++
++func main() {
+ 	user := os.Getenv("ISUDA_DB_USER")
+ 	if user == "" {
+ 		user = "root"
+@@ -411,21 +480,41 @@
+ 	if dbname == "" {
+ 		dbname = "isuda"
+ 	}
++	dbunix := os.Getenv("ISUDA_DB_UNIX")
++	if dbunix == "" {
++		dbunix = "/var/run/mysqld/mysqld.sock"
++	}
++
++	dsn := fmt.Sprintf(
++		"%s:%s@unix(%s)/%s?loc=Local&parseTime=true&interpolateParams=true&collation=utf8mb4_bin",
++		user, password, dbunix, dbname)
++	log.Println("dsn: ", dsn)
++	var err error
++	db, err = sql.Open("mysql", dsn)
++	panicIf(err)
++	db.SetMaxOpenConns(16)
++	db.SetMaxIdleConns(16)
++
++	for {
++		err := db.Ping()
++		if err == nil {
++			break
++		}
++		log.Println(err)
++		time.Sleep(time.Millisecond * 100)
++	}
++
++	HostName = os.Getenv("ISUHOST")
++	if HostName == "" {
++		HostName = "127.0.0.1"
++	}
++	Startup()
+ 
+-	db, err = sql.Open("mysql", fmt.Sprintf(
+-		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
+-		user, password, host, port, dbname,
+-	))
+ 	if err != nil {
+ 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+ 	}
+ 	db.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
+-	db.Exec("SET NAMES utf8mb4")
+ 
+-	isutarEndpoint = os.Getenv("ISUTAR_ORIGIN")
+-	if isutarEndpoint == "" {
+-		isutarEndpoint = "http://localhost:5001"
+-	}
+ 	isupamEndpoint = os.Getenv("ISUPAM_ORIGIN")
+ 	if isupamEndpoint == "" {
+ 		isupamEndpoint = "http://localhost:5050"
+@@ -455,8 +544,11 @@
+ 		},
+ 	})
+ 
++	go func() {
++		log.Println(http.ListenAndServe(":6060", nil))
++	}()
++
+ 	r := mux.NewRouter()
+-	r.UseEncodedPath()
+ 	r.HandleFunc("/", myHandler(topHandler))
+ 	r.HandleFunc("/initialize", myHandler(initializeHandler)).Methods("GET")
+ 	r.HandleFunc("/robots.txt", myHandler(robotsHandler))
+@@ -475,6 +567,11 @@
+ 	k.Methods("GET").HandlerFunc(myHandler(keywordByKeywordHandler))
+ 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
+ 
++	s := r.PathPrefix("/stars").Subrouter()
++	s.Methods("GET").HandlerFunc(myHandler(starsHandler))
++	s.Methods("POST").HandlerFunc(myHandler(starsPostHandler))
++
+ 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
+ 	log.Fatal(http.ListenAndServe(":5000", r))
++
+ }
